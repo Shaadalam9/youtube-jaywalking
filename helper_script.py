@@ -1,5 +1,4 @@
-# helper_script.py , interactive FTP + YOLO Video Analyzer
-
+# helper_script.py
 
 import os
 import re
@@ -14,20 +13,16 @@ import numpy as np
 import requests
 import yaml
 from tqdm import tqdm
-from pytubefix import YouTube
-from pytubefix.cli import on_progress
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from ultralytics import YOLO
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 from custom_logger import CustomLogger
 import common
 
-# ------------------ LOGGER ------------------
 logger = CustomLogger(__name__)
 os.makedirs("runs", exist_ok=True)
 
-# ------------------ CONSTANTS ------------------
 LINE_THICKNESS = 1
 RENDER = False
 SHOW_LABELS = False
@@ -63,18 +58,23 @@ class Youtube_Helper:
             return None
 
         filename_mp4 = filename if filename.endswith(".mp4") else f"{filename}.mp4"
+        local_path = os.path.join(out_dir, filename_mp4)
         os.makedirs(out_dir, exist_ok=True)
+
+        # Skip if already exists
+        if os.path.exists(local_path):
+            logger.info(f"{filename_mp4} already exists. Skipping FTP download.")
+            fps = self.get_video_fps(local_path)
+            res = self.get_video_resolution_label(local_path)
+            return local_path, filename, res, fps
 
         try:
             with requests.Session() as session:
                 session.auth = (username, password)
                 session.headers.update({"User-Agent": "ftp-video-downloader/1.0"})
 
-                # FTP has directory structure /v/tue1/browse etc.
                 for alias in ["tue1", "tue2", "tue3"]:
                     browse_url = urljoin(base_url, f"v/{alias}/browse")
-                    logger.info(f"Searching in: {browse_url}")
-
                     resp = session.get(browse_url, timeout=timeout)
                     if resp.status_code != 200:
                         continue
@@ -84,8 +84,6 @@ class Youtube_Helper:
                         href = a.get("href", "")
                         if filename_mp4 in href:
                             file_url = urljoin(base_url, href)
-                            local_path = os.path.join(out_dir, filename_mp4)
-
                             with session.get(file_url, stream=True) as r:
                                 r.raise_for_status()
                                 total = int(r.headers.get("content-length", 0))
@@ -108,26 +106,37 @@ class Youtube_Helper:
             return None
 
     # ------------------ YOUTUBE FALLBACK ------------------
-    def download_video_with_resolution(self, vid, resolutions=["720p", "480p", "360p"], output_path="."):
-        """Download YouTube video using pytubefix with preferred resolutions."""
+    def download_video_with_resolution(self, vid, output_path=".", resolutions=["720p", "480p", "360p"]):
+        """Download YouTube video using yt-dlp (no login required)."""
         try:
-            yt_url = f"https://www.youtube.com/watch?v={vid}"
-            if self.need_authentication:
-                yt = YouTube(yt_url, self.client, use_oauth=True, allow_oauth_cache=True, on_progress_callback=on_progress)
-            else:
-                yt = YouTube(yt_url, self.client, on_progress_callback=on_progress)
+            import yt_dlp
 
-            for res in resolutions:
-                stream = yt.streams.filter(res=res).first()
-                if stream:
-                    output_file = os.path.join(output_path, f"{vid}.mp4")
-                    logger.info(f"Downloading {vid} in {res}...")
-                    stream.download(output_path, filename=f"{vid}.mp4")
-                    fps = self.get_video_fps(output_file)
-                    logger.info(f" Download complete: {output_file}")
-                    return output_file, vid, res, fps
-            logger.error(f"No matching resolution found for {vid}")
-            return None
+            os.makedirs(output_path, exist_ok=True)
+            output_file = os.path.join(output_path, f"{vid}.mp4")
+
+            if os.path.exists(output_file):
+                logger.info(f" {vid}.mp4 already exists. Skipping YouTube download.")
+                fps = self.get_video_fps(output_file)
+                res = self.get_video_resolution_label(output_file)
+                return output_file, vid, res, fps
+
+            logger.info(f"Downloading {vid} from YouTube...")
+            ydl_opts = {
+                "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best",
+                "merge_output_format": "mp4",
+                "outtmpl": output_file,
+                "quiet": False,
+                "noprogress": False,
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={vid}"])
+
+            fps = self.get_video_fps(output_file)
+            res = self.get_video_resolution_label(output_file)
+            logger.info(f"YouTube download complete: {output_file}")
+            return output_file, vid, res, fps
+
         except Exception as e:
             logger.error(f"YouTube download failed: {e}")
             return None
@@ -139,7 +148,7 @@ class Youtube_Helper:
             vid = cv2.VideoCapture(video_file_path)
             fps = vid.get(cv2.CAP_PROP_FPS)
             vid.release()
-            return round(fps, 0)
+            return round(fps or 30.0, 0)
         except Exception as e:
             logger.error(f"FPS retrieval failed: {e}")
             return 30.0
@@ -150,7 +159,7 @@ class Youtube_Helper:
         cap = cv2.VideoCapture(video_path)
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cap.release()
-        resolutions = {144: "144p", 240: "240p", 360: "360p", 480: "480p", 720: "720p", 1080: "1080p", 1440: "1440p"}
+        resolutions = {144: "144p", 240: "240p", 360: "360p", 480: "480p", 720: "720p", 1080: "1080p"}
         return resolutions.get(height, f"{height}p")
 
     def trim_video(self, input_path, output_path, start_time, end_time):
@@ -167,24 +176,24 @@ class Youtube_Helper:
     # ------------------ YOLO TRACKING ------------------
     def update_track_buffer_in_yaml(self, yaml_path, video_fps):
         """Update YAML file with track buffer (based on fps)."""
-        with open(yaml_path, "r") as f:
-            cfg = yaml.safe_load(f)
-        cfg["track_buffer"] = common.get_configs("track_buffer_sec") * video_fps
-        with open(yaml_path, "w") as f:
-            yaml.dump(cfg, f)
+        try:
+            with open(yaml_path, "r") as f:
+                cfg = yaml.safe_load(f)
+            cfg["track_buffer"] = common.get_configs("track_buffer_sec") * video_fps
+            with open(yaml_path, "w") as f:
+                yaml.dump(cfg, f)
+        except Exception as e:
+            logger.error(f"YAML update failed: {e}")
 
     def tracking_mode(self, input_video_path, output_video_path, video_title, video_fps,
                       seg_mode=False, bbox_mode=True, flag=0):
         """Run YOLOv11 object tracking and save annotated video."""
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        if bbox_mode:
-            self.update_track_buffer_in_yaml(self.bbox_tracker, video_fps)
-            model = YOLO(self.tracking_model)
-        elif seg_mode:
-            self.update_track_buffer_in_yaml(self.seg_tracker, video_fps)
-            model = YOLO(self.segment_model)
-        else:
-            return
+        model_path = self.tracking_model if bbox_mode else self.segment_model
+        tracker_yaml = self.bbox_tracker if bbox_mode else self.seg_tracker
+
+        self.update_track_buffer_in_yaml(tracker_yaml, video_fps)
+        model = YOLO(model_path)
 
         cap = cv2.VideoCapture(input_video_path)
         frame_width, frame_height = int(cap.get(3)), int(cap.get(4))
@@ -194,7 +203,6 @@ class Youtube_Helper:
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out = cv2.VideoWriter(out_path, fourcc, video_fps, (frame_width, frame_height))
-
         progress = tqdm(total=total_frames, desc="Detecting", unit="frames")
 
         while True:
@@ -202,7 +210,7 @@ class Youtube_Helper:
             if not success:
                 break
             try:
-                results = model.track(frame, tracker=self.bbox_tracker if bbox_mode else self.seg_tracker,
+                results = model.track(frame, tracker=tracker_yaml,
                                       persist=True, conf=self.confidence, verbose=False, device=device)
                 annotated = results[0].plot()
                 out.write(annotated)
