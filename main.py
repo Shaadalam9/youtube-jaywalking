@@ -1,4 +1,7 @@
-# main.py — Fully Automated FTP + YOLO + Analytics Pipeline
+# main.py — Automated Pedestrian Behaviour Detection using YOLOv11
+# Uses country + city filter from mapping.csv
+#  No manual inputs or prints — fully automated execution
+#  Works with existing helper_script, algorithms, and common modules
 
 import os
 import pandas as pd
@@ -6,6 +9,14 @@ from dotenv import load_dotenv
 from helper_script import Youtube_Helper
 from algorithms import Algorithms
 import common
+import logging
+
+# --- Setup logging (no print, all logs go to file) ---
+logging.basicConfig(
+    filename="run_log.txt",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 # --- Load environment variables ---
 load_dotenv()
@@ -27,9 +38,23 @@ algo = Algorithms()
 mapping_path = common.get_configs("mapping")
 df_mapping = pd.read_csv(mapping_path)
 
-# --- Flatten all video IDs from mapping.csv ---
+# --- Filter based on COUNTRY and CITY ---
+# ⚙️ Set your desired country and city here:
+target_country = "Netherlands"   # change this
+target_city = "Eindhoven"        # change this
+
+subset_df = df_mapping[
+    (df_mapping["country"].str.lower() == target_country.lower()) &
+    (df_mapping["city"].str.lower() == target_city.lower())
+]
+
+if subset_df.empty:
+    logging.warning(f"No entries found for {target_country}, {target_city}. Exiting pipeline.")
+    raise SystemExit()
+
+# --- Flatten all video IDs for selected region ---
 all_video_ids = []
-for vids in df_mapping["videos"]:
+for vids in subset_df["videos"]:
     if isinstance(vids, list):
         all_video_ids.extend(vids)
     elif isinstance(vids, str):
@@ -37,15 +62,14 @@ for vids in df_mapping["videos"]:
         all_video_ids.extend([v.strip().strip("'\"") for v in vids.split(",") if v.strip()])
 
 all_video_ids = list(set(all_video_ids))  # remove duplicates
-print(f"\nTotal videos found in mapping.csv: {len(all_video_ids)}")
+logging.info(f"Processing {len(all_video_ids)} videos for {target_city}, {target_country}")
 
-print("\n Starting Automated Processing...\n")
-
+# --- Process each video automatically ---
 for idx, video_id in enumerate(all_video_ids, start=1):
     try:
-        print(f"\n[{idx}/{len(all_video_ids)}] 📥 Processing video: {video_id} ...")
+        logging.info(f"[{idx}/{len(all_video_ids)}] Starting video ID: {video_id}")
 
-        # Step 1: Try FTP first
+        # Step 1: Try FTP download
         result = helper.download_videos_from_ftp(
             filename=video_id,
             base_url=ftp_server,
@@ -54,20 +78,19 @@ for idx, video_id in enumerate(all_video_ids, start=1):
             password=ftp_password
         )
 
-        # Step 2: Fallback to YouTube if FTP fails
+        # Step 2: Fallback to YouTube
         if not result:
-            print(" FTP not found — trying YouTube...")
+            logging.warning(f"{video_id}: FTP not found — switching to YouTube.")
             result = helper.download_video_with_resolution(vid=video_id, output_path=input_folder)
 
         if not result:
-            print(f" Skipping {video_id}: could not download.")
+            logging.error(f"{video_id}: Failed to download from FTP or YouTube.")
             continue
 
         video_path, video_title, resolution, fps = result
-        print(f" Downloaded successfully: {video_path}")
+        logging.info(f"{video_id}: Download successful ({resolution}, {fps} FPS).")
 
-        # Step 3: YOLO Detection
-        print(" Running YOLO detection...")
+        # Step 3: YOLOv11 Detection
         fps_val = helper.get_video_fps(video_path) or 30
         helper.tracking_mode(
             input_video_path=video_path,
@@ -78,36 +101,31 @@ for idx, video_id in enumerate(all_video_ids, start=1):
             bbox_mode=True,
             flag=1
         )
+        logging.info(f"{video_id}: YOLO detection completed successfully.")
 
-        print(f"Detection completed for {video_id}")
-
-        # Step 4: Run Analytics
+        # Step 4: Run analytics (behaviour analysis)
         tracking_csv = os.path.join(output_folder, f"{video_id}_tracking.csv")
         analytics_csv = os.path.join(output_folder, f"{video_id}_analytics.csv")
 
         if os.path.exists(tracking_csv):
             df = pd.read_csv(tracking_csv)
-
-            print("Running analytics...")
             crossed = algo.pedestrian_crossing(df, video_id, df_mapping)
             speed_df = algo.calculate_speed_of_crossing(df, fps_val)
             time_df = algo.time_to_cross(df, fps_val)
 
-            # Merge results
             analytics_df = pd.merge(time_df, speed_df, on="person_id", how="outer")
             analytics_df["video_id"] = video_id
             analytics_df["num_crossed"] = len(crossed)
+            analytics_df["country"] = target_country
+            analytics_df["city"] = target_city
             analytics_df.to_csv(analytics_csv, index=False)
 
-            print(f" Analytics complete for {video_id}")
-            print(f" Pedestrians crossed: {len(crossed)}")
-            print(f" Saved analytics: {analytics_csv}\n")
+            logging.info(f"{video_id}: Analytics completed. Saved to {analytics_csv}")
         else:
-            print(" No tracking data found — skipping analytics.")
+            logging.warning(f"{video_id}: Tracking file not found, skipping analytics.")
 
     except Exception as e:
-        print(f" Error processing {video_id}: {e}")
+        logging.error(f"{video_id}: Error during processing — {e}")
         continue
 
-print("\n All videos processed successfully!")
-print(f"Check results inside: {output_folder}")
+logging.info(f" Processing complete for {target_city}, {target_country}. All outputs in {output_folder}")
