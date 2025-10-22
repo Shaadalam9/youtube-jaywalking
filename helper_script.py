@@ -269,4 +269,4 @@ class Youtube_Helper:
         out.release()
         progress.close()
         cv2.destroyAllWindows()
-        logger.info(f"✅ YOLO detection finished. Output saved to {out_path}")
+        logger.info(f"YOLO detection finished. Output saved to {out_path}")
