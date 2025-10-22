@@ -1,112 +1,113 @@
-# main.py — Automated Video Analyzer using mapping.csv
-# Description:
-# Reads mapping.csv, downloads each video (FTP → YouTube fallback),
-# optionally trims based on timestamps, and runs YOLOv11 detection.
+# main.py — Fully Automated FTP + YOLO + Analytics Pipeline
 
 import os
 import pandas as pd
 from dotenv import load_dotenv
 from helper_script import Youtube_Helper
+from algorithms import Algorithms
+import common
 
-# --- Load FTP credentials from .env ---
+# --- Load environment variables ---
 load_dotenv()
 ftp_server = os.getenv("FTP_SERVER")
 ftp_username = os.getenv("FTP_USERNAME")
 ftp_password = os.getenv("FTP_PASSWORD")
 
-# --- Folder Setup ---
-videos_folder = "./videos"
+# --- Directories ---
+input_folder = "./videos"
 output_folder = "./outputs"
-os.makedirs(videos_folder, exist_ok=True)
+os.makedirs(input_folder, exist_ok=True)
 os.makedirs(output_folder, exist_ok=True)
 
-# --- Load mapping file ---
-mapping_file = "./mapping.csv"
-if not os.path.exists(mapping_file):
-    raise FileNotFoundError("mapping.csv not found! Please place it in the project folder.")
-
-mapping_df = pd.read_csv(mapping_file)
-
-# --- Validate 'videos' column ---
-if "videos" not in mapping_df.columns:
-    raise ValueError("mapping.csv must contain a 'videos' column.")
-
-print("\n Automated Video Analyzer — Using Mapping File")
-print("--------------------------------------------------")
-
-# --- Initialize helper ---
+# --- Initialize helper and analytics classes ---
 helper = Youtube_Helper()
+algo = Algorithms()
 
-# --- Main Loop: Process each row in mapping.csv ---
-for idx, row in mapping_df.iterrows():
-    # Parse multiple video IDs from a single cell
-    raw_videos = str(row["videos"]).strip()
-    raw_videos = raw_videos.replace("[", "").replace("]", "").replace("'", "").replace('"', "")
-    video_ids = [v.strip() for v in raw_videos.split(",") if v.strip()]
+# --- Load mapping file ---
+mapping_path = common.get_configs("mapping")
+df_mapping = pd.read_csv(mapping_path)
 
-    city = row.get("city", "Unknown")
-    start_time = row.get("start_time", None)
-    end_time = row.get("end_time", None)
+# --- Flatten all video IDs from mapping.csv ---
+all_video_ids = []
+for vids in df_mapping["videos"]:
+    if isinstance(vids, list):
+        all_video_ids.extend(vids)
+    elif isinstance(vids, str):
+        vids = vids.strip("[] ")
+        all_video_ids.extend([v.strip().strip("'\"") for v in vids.split(",") if v.strip()])
 
+all_video_ids = list(set(all_video_ids))  # remove duplicates
+print(f"\nTotal videos found in mapping.csv: {len(all_video_ids)}")
+
+print("\n Starting Automated Processing...\n")
+
+for idx, video_id in enumerate(all_video_ids, start=1):
     try:
-        start_time = float(start_time) if pd.notna(start_time) else None
-        end_time = float(end_time) if pd.notna(end_time) else None
-    except Exception:
-        start_time, end_time = None, None
+        print(f"\n[{idx}/{len(all_video_ids)}] 📥 Processing video: {video_id} ...")
 
-    #  Process each video ID individually
-    for video_id in video_ids:
-        print(f"\n🎬 Processing video: {video_id} ({city})")
-        print(f"Start: {start_time or 'N/A'}s | End: {end_time or 'N/A'}s")
+        # Step 1: Try FTP first
+        result = helper.download_videos_from_ftp(
+            filename=video_id,
+            base_url=ftp_server,
+            out_dir=input_folder,
+            username=ftp_username,
+            password=ftp_password
+        )
 
-        try:
-            #  Try FTP download
-            print("📥 Downloading video from FTP...")
-            result = helper.download_videos_from_ftp(
-                filename=video_id,
-                base_url=ftp_server,
-                out_dir=videos_folder,
-                username=ftp_username,
-                password=ftp_password
-            )
+        # Step 2: Fallback to YouTube if FTP fails
+        if not result:
+            print(" FTP not found — trying YouTube...")
+            result = helper.download_video_with_resolution(vid=video_id, output_path=input_folder)
 
-            #  Fallback — try YouTube if FTP fails
-            if not result:
-                print(" FTP failed — trying YouTube...")
-                result = helper.download_video_with_resolution(vid=video_id, output_path=videos_folder)
+        if not result:
+            print(f" Skipping {video_id}: could not download.")
+            continue
 
-            if not result:
-                print(f"Skipping {video_id} — could not download from FTP or YouTube.")
-                continue
+        video_path, video_title, resolution, fps = result
+        print(f" Downloaded successfully: {video_path}")
 
-            #  Successful download → unpack result
-            video_path, video_title, resolution, fps = result
-            print(f"Downloaded: {video_path} ({resolution}, {fps} FPS)")
+        # Step 3: YOLO Detection
+        print(" Running YOLO detection...")
+        fps_val = helper.get_video_fps(video_path) or 30
+        helper.tracking_mode(
+            input_video_path=video_path,
+            output_video_path=output_folder,
+            video_title=os.path.basename(video_path),
+            video_fps=int(fps_val),
+            seg_mode=False,
+            bbox_mode=True,
+            flag=1
+        )
 
-            # Step : Trim video (if timestamps available)
-            trimmed_path = video_path
-            if start_time and end_time and end_time > start_time:
-                trimmed_path = os.path.join(videos_folder, f"{video_id}_trimmed.mp4")
-                helper.trim_video(video_path, trimmed_path, start_time, end_time)
-                print(f"Trimmed segment saved at {trimmed_path}")
+        print(f"Detection completed for {video_id}")
 
-            # Step : YOLOv11 Object Detection
-            print("Running object detection/tracking...")
-            fps_val = helper.get_video_fps(trimmed_path) or 30
-            helper.tracking_mode(
-                input_video_path=trimmed_path,
-                output_video_path=output_folder,
-                video_title=os.path.basename(trimmed_path),
-                video_fps=int(fps_val),
-                seg_mode=False,      # segmentation off
-                bbox_mode=True,      # bounding-box detection
-                flag=1               # save annotated video
-            )
+        # Step 4: Run Analytics
+        tracking_csv = os.path.join(output_folder, f"{video_id}_tracking.csv")
+        analytics_csv = os.path.join(output_folder, f"{video_id}_analytics.csv")
 
-            print(f"Detection complete for {video_id}")
-            print(f" Output saved in: {output_folder}\n")
+        if os.path.exists(tracking_csv):
+            df = pd.read_csv(tracking_csv)
 
-        except Exception as e:
-            print(f" Error processing {video_id}: {e}")
+            print("Running analytics...")
+            crossed = algo.pedestrian_crossing(df, video_id, df_mapping)
+            speed_df = algo.calculate_speed_of_crossing(df, fps_val)
+            time_df = algo.time_to_cross(df, fps_val)
 
-print("\n All videos processed successfully using mapping.csv!")
+            # Merge results
+            analytics_df = pd.merge(time_df, speed_df, on="person_id", how="outer")
+            analytics_df["video_id"] = video_id
+            analytics_df["num_crossed"] = len(crossed)
+            analytics_df.to_csv(analytics_csv, index=False)
+
+            print(f" Analytics complete for {video_id}")
+            print(f" Pedestrians crossed: {len(crossed)}")
+            print(f" Saved analytics: {analytics_csv}\n")
+        else:
+            print(" No tracking data found — skipping analytics.")
+
+    except Exception as e:
+        print(f" Error processing {video_id}: {e}")
+        continue
+
+print("\n All videos processed successfully!")
+print(f"Check results inside: {output_folder}")
